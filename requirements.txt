@@ -1,0 +1,32 @@
+# --- Core API & Web Server ---
+fastapi==0.115.0
+uvicorn==0.46.0
+python-multipart==0.0.12
+requests==2.33.1
+python-dotenv==1.2.2
+
+# --- RAG & AI Orchestration (Loosened for compatibility) ---
+langchain
+langchain-community
+langchain-core
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+
+# --- Vector Database & Math ---
+faiss-cpu
+numpy
+scipy
+sentence-transformers
+
+# --- Document Processing ---
+pypdf
+python-docx
+
+# --- Supporting Libraries ---
+pydantic
+pydantic-settings
+typing-extensions
+aiohttp
+httpx
+PyYAML

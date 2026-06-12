@@ -1,0 +1,498 @@
+import io
+import traceback
+import uvicorn
+import httpx
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
+
+import pypdf
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+from src.pipeline import build_verification_pipeline
+
+
+# ─────────────────────────────────────────────────────
+#  Archer Configuration
+# ─────────────────────────────────────────────────────
+ARCHER_BASE_URL = "https://kpmg-test-nfr.archerirm.com.au"
+ARCHER_INSTANCE = "710209"
+ARCHER_USERNAME = "tprmpoc"
+ARCHER_PASSWORD = "Archer@123"
+
+# Field IDs on the main record — Q1
+ARCHER_FIELD_QUESTION   = "40109"   # Type 4 Values List — Q1 Yes/No answer
+ARCHER_FIELD_ATTACHMENT = "40104"   # Type 11 Cross-reference — links to evidence sub-record
+
+# Field IDs — Q2
+ARCHER_FIELD_QUESTION_2   = "40110"
+ARCHER_FIELD_ATTACHMENT_2 = "40105"
+
+# Field IDs — Q3
+ARCHER_FIELD_QUESTION_3   = "40121"
+ARCHER_FIELD_ATTACHMENT_3 = "40122"
+
+# Grouped for iteration — order = Q1, Q2, Q3
+ARCHER_QA_PAIRS = [
+    {"question_field": ARCHER_FIELD_QUESTION,   "attachment_field": ARCHER_FIELD_ATTACHMENT},
+    {"question_field": ARCHER_FIELD_QUESTION_2, "attachment_field": ARCHER_FIELD_ATTACHMENT_2},
+    {"question_field": ARCHER_FIELD_QUESTION_3, "attachment_field": ARCHER_FIELD_ATTACHMENT_3},
+]
+
+MAX_PDF_BYTES = 20 * 1024 * 1024    # 20 MB
+
+
+# ─────────────────────────────────────────────────────
+#  Globals
+# ─────────────────────────────────────────────────────
+verify_chain     = None
+local_embeddings = None
+
+
+# ─────────────────────────────────────────────────────
+#  Lifespan
+# ─────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global verify_chain, local_embeddings
+
+    print("[startup] Loading embedding model...")
+    try:
+        local_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        print("[startup] ✅ Embedding model ready.")
+    except Exception as e:
+        print(f"[startup] FATAL — embedding model failed: {e}")
+        raise
+
+    print("[startup] Building verification pipeline...")
+    try:
+        verify_chain = build_verification_pipeline()
+        print("[startup] ✅ Verification pipeline ready.")
+    except Exception as e:
+        print(f"[startup] FATAL — pipeline failed: {e}")
+        raise
+
+    print("[startup] ✅ Archer AI Auditor v4.0 is ready.\n")
+    yield
+    print("[shutdown] Server shutting down.")
+
+
+# ─────────────────────────────────────────────────────
+#  App
+# ─────────────────────────────────────────────────────
+app = FastAPI(title="Archer AI Auditor", version="4.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────
+#  Global error catcher
+# ─────────────────────────────────────────────────────
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[SERVER ERROR]\n{tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+
+
+# ─────────────────────────────────────────────────────
+#  Request model
+# ─────────────────────────────────────────────────────
+class AnalyzeRequest(BaseModel):
+    record_id: str
+
+    @field_validator("record_id")
+    @classmethod
+    def record_id_must_not_be_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("record_id is empty.")
+        return v.strip()
+
+
+# ─────────────────────────────────────────────────────
+#  Archer API helpers
+# ─────────────────────────────────────────────────────
+
+async def archer_login(client: httpx.AsyncClient) -> str:
+    """Login to Archer, return session token."""
+    print("[Archer] Logging in...")
+    instances_to_try = [ARCHER_INSTANCE, "KPMG-TEST-NFR", ""]
+    for instance in instances_to_try:
+        try:
+            print(f"[Archer] Trying instance: '{instance}'")
+            resp = await client.post(
+                f"{ARCHER_BASE_URL}/api/core/security/login",
+                json={
+                    "InstanceName": instance,
+                    "Username":     ARCHER_USERNAME,
+                    "UserDomain":   "",
+                    "Password":     ARCHER_PASSWORD,
+                },
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("IsSuccessful"):
+                    token = data["RequestedObject"]["SessionToken"]
+                    print("[Archer] ✅ Login successful.")
+                    return token
+        except Exception as e:
+            print(f"[Archer] Login attempt failed for '{instance}': {e}")
+
+    raise HTTPException(status_code=502, detail="Archer login failed. Check credentials.")
+
+
+async def archer_get_record(client: httpx.AsyncClient, token: str, record_id: str) -> dict:
+    """Fetch Archer record by ID."""
+    print(f"[Archer] Fetching record {record_id}...")
+    resp = await client.get(
+        f"{ARCHER_BASE_URL}/api/core/content/{record_id}",
+        headers={
+            "Authorization": f"Archer session-id={token}",
+            "Accept":        "application/json",
+        },
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Fetch failed: {resp.text[:200]}")
+
+    data = resp.json()
+    field_contents = data.get("RequestedObject", {}).get("FieldContents", {})
+    print(f"[DEBUG] Field IDs in record: {list(field_contents.keys())}")
+    for fid, fval in field_contents.items():
+        print(f"[DEBUG] Field {fid}: {str(fval)[:150]}")
+
+    print("[Archer] ✅ Record fetched.")
+    return data
+
+
+async def archer_get_field_definition(client: httpx.AsyncClient, token: str, field_id: str) -> str:
+    """
+    Fetch field definition to get the question label (Name).
+    e.g. field 40109 → "Q1.Are you ISO27001_Certified?"
+    """
+    print(f"[Archer] Fetching field definition for field {field_id}...")
+    resp = await client.get(
+        f"{ARCHER_BASE_URL}/api/core/system/fielddefinition/{field_id}",
+        headers={
+            "Authorization": f"Archer session-id={token}",
+            "Accept":        "application/json",
+        },
+    )
+    if resp.status_code != 200:
+        print(f"[Archer] Field definition fetch failed: HTTP {resp.status_code}")
+        return f"Question (field {field_id})"   # fallback
+
+    data  = resp.json()
+    name  = data.get("RequestedObject", {}).get("Name", "")
+    alias = data.get("RequestedObject", {}).get("Alias", "")
+    question_text = name if name else alias.replace("_", " ")
+    print(f"[Archer] ✅ Question text: {question_text}")
+    return question_text
+
+
+async def archer_download_attachment(client: httpx.AsyncClient, token: str, attach_id: str) -> bytes:
+    """
+    Download PDF from Archer by trying multiple endpoint patterns.
+    Also handles base64-encoded JSON responses (some Archer versions).
+    """
+    import base64 as b64mod
+
+    headers = {
+        "Authorization": f"Archer session-id={token}",
+        "Accept":        "application/json",
+        "Content-Type":  "application/json",
+    }
+
+    get_urls = [
+        f"{ARCHER_BASE_URL}/platformapi/core/content/attachment/{attach_id}",
+        f"{ARCHER_BASE_URL}/api/core/content/attachment/{attach_id}",
+        f"{ARCHER_BASE_URL}/platformapi/core/attachment/{attach_id}/content",
+        f"{ARCHER_BASE_URL}/api/core/attachment/{attach_id}/content",
+        f"{ARCHER_BASE_URL}/api/core/content/attachmentfile/{attach_id}",
+    ]
+
+    for url in get_urls:
+        try:
+            print(f"[Archer] GET {url}")
+            resp = await client.get(url, headers=headers, timeout=60)
+            ct   = resp.headers.get("content-type", "")
+            size = len(resp.content)
+            print(f"[Archer] HTTP {resp.status_code} | {ct} | {size:,} bytes")
+
+            if resp.status_code == 200 and size > 500:
+                if "text/html" in ct and size < 10_000:
+                    print("[Archer] HTML error page — skipping")
+                    continue
+
+                if "application/json" in ct:
+                    try:
+                        b64_data = (
+                            resp.json()
+                                .get("RequestedObject", {})
+                                .get("AttachmentBytes", "")
+                        )
+                        if b64_data:
+                            decoded = b64mod.b64decode(b64_data)
+                            print(f"[Archer] ✅ Base64 decoded: {len(decoded):,} bytes")
+                            return decoded
+                    except Exception as e:
+                        print(f"[Archer] JSON parse error: {e}")
+                    continue
+
+                print(f"[Archer] ✅ Raw binary: {size:,} bytes")
+                return resp.content
+
+        except Exception as e:
+            print(f"[Archer] Error on {url}: {e}")
+            continue
+
+    try:
+        post_url = f"{ARCHER_BASE_URL}/platformapi/core/content/attachment"
+        print(f"[Archer] POST {post_url}")
+        resp = await client.post(
+            post_url,
+            json={"AttachmentId": int(attach_id)},
+            headers=headers,
+            timeout=60,
+        )
+        ct   = resp.headers.get("content-type", "")
+        size = len(resp.content)
+        print(f"[Archer] POST HTTP {resp.status_code} | {size:,} bytes")
+
+        if resp.status_code == 200 and size > 500 and "text/html" not in ct:
+            if "application/json" in ct:
+                try:
+                    b64_data = (
+                        resp.json()
+                            .get("RequestedObject", {})
+                            .get("AttachmentBytes", "")
+                    )
+                    if b64_data:
+                        decoded = b64mod.b64decode(b64_data)
+                        print(f"[Archer] ✅ POST base64: {len(decoded):,} bytes")
+                        return decoded
+                except Exception as e:
+                    print(f"[Archer] POST JSON error: {e}")
+            print(f"[Archer] ✅ POST raw: {size:,} bytes")
+            return resp.content
+
+    except Exception as e:
+        print(f"[Archer] POST error: {e}")
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Could not download attachment ID '{attach_id}'. All endpoint patterns failed."
+    )
+
+
+# ─────────────────────────────────────────────────────
+#  RAG pipeline
+# ─────────────────────────────────────────────────────
+def run_rag_pipeline(pdf_bytes: bytes, question: str) -> str:
+    """PDF → chunk → embed → FAISS → LLM → answer."""
+    if len(pdf_bytes) < 100:
+        raise ValueError("PDF is too small or corrupt.")
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise ValueError(f"PDF exceeds {MAX_PDF_BYTES // (1024*1024)} MB limit.")
+
+    try:
+        reader    = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        full_text = "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+    except Exception as e:
+        raise ValueError(f"PDF read error: {e}")
+
+    if not full_text.strip():
+        raise ValueError("PDF has no extractable text (scanned image?).")
+
+    print(f"[RAG] Extracted {len(full_text):,} characters from PDF.")
+
+    splitter      = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks        = splitter.split_text(full_text)
+    temp_db       = FAISS.from_texts(chunks, local_embeddings)
+    relevant_docs = temp_db.similarity_search(question, k=4)
+    context_text  = "\n\n".join(doc.page_content for doc in relevant_docs)
+
+    print(f"[RAG] Using {len(relevant_docs)} chunks as context.")
+
+    result = verify_chain.invoke({"question": question, "context": context_text})
+
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return (
+            result.get("analysis") or
+            result.get("answer")   or
+            result.get("text")     or
+            result.get("output")   or
+            str(result)
+        )
+    return getattr(result, "content", str(result))
+
+
+# ─────────────────────────────────────────────────────
+#  Helper — process one QA pair
+# ─────────────────────────────────────────────────────
+async def process_qa_pair(
+    client: httpx.AsyncClient,
+    token: str,
+    field_contents: dict,
+    question_field: str,
+    attachment_field: str,
+    label: str,          # e.g. "Q1", "Q2", "Q3" — for logging only
+) -> str:
+    """
+    For a single question+attachment pair:
+      1. Resolve question text from field definition
+      2. Extract attachment ID from cross-reference field
+      3. Download PDF
+      4. Run RAG pipeline
+    Returns the answer string, or an error message if something goes wrong.
+    """
+    # ── Question text ─────────────────────────────────
+    question_text = await archer_get_field_definition(client, token, question_field)
+
+    q_field = field_contents.get(question_field, {})
+    if q_field and isinstance(q_field.get("Value"), dict):
+        values_list_ids = q_field["Value"].get("ValuesListIds", [])
+        if values_list_ids:
+            question_text = f"{question_text} (Vendor answered: ValueListId={values_list_ids[0]})"
+
+    print(f"[{label}] Question: {question_text}")
+
+    # ── Attachment ID ─────────────────────────────────
+    attach_field   = field_contents.get(attachment_field, {})
+    sub_record_ids = attach_field.get("Value", []) if attach_field else []
+
+    if not sub_record_ids:
+        msg = f"No evidence sub-record found in field {attachment_field}."
+        print(f"[{label}] ⚠️  {msg}")
+        return f"SKIPPED — {msg}"
+
+    attach_id = str(sub_record_ids[0])
+    print(f"[{label}] Attachment ID: {attach_id}")
+
+    # ── Download PDF ──────────────────────────────────
+    try:
+        pdf_bytes = await archer_download_attachment(client, token, attach_id)
+    except HTTPException as e:
+        print(f"[{label}] ⚠️  PDF download failed: {e.detail}")
+        return f"SKIPPED — PDF download failed: {e.detail}"
+
+    # ── RAG ───────────────────────────────────────────
+    try:
+        answer = run_rag_pipeline(pdf_bytes, question_text)
+    except ValueError as e:
+        print(f"[{label}] ⚠️  RAG error: {e}")
+        return f"SKIPPED — RAG error: {e}"
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[{label}] RAG error:\n{tb}")
+        return f"ERROR — RAG pipeline failed: {e}"
+
+    print(f"[{label}] ✅ Answer ready ({len(str(answer))} chars)")
+    return str(answer)
+
+
+# ─────────────────────────────────────────────────────
+#  Routes
+# ─────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Archer AI Auditor v4.0 is Live!",
+        "endpoints": {
+            "health":  "GET  /health",
+            "analyze": "POST /analyze — send { record_id }",
+            "docs":    "GET  /docs",
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status":     "ok",
+        "service":    "Archer AI Evidence Validator v4.0",
+        "pipeline":   "loaded" if verify_chain     else "NOT LOADED",
+        "embeddings": "loaded" if local_embeddings else "NOT LOADED",
+        "archer":     ARCHER_BASE_URL,
+    }
+
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest):
+    """
+    JS sends only { record_id }.
+    FastAPI:
+      1. Login to Archer
+      2. Fetch main record → get all field contents once
+      3. For each of Q1 / Q2 / Q3:
+           a. Fetch field definition → question text
+           b. Extract attachment ID from cross-reference field
+           c. Download PDF
+           d. Run RAG pipeline → answer
+      4. Return { answer_q1, answer_q2, answer_q3, record_id }
+    """
+    print(f"\n{'='*60}")
+    print(f"[/analyze] Starting — Record ID: {req.record_id}")
+    print(f"{'='*60}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+
+        # ── 1. Login ─────────────────────────────────────────────
+        token = await archer_login(client)
+
+        # ── 2. Fetch main record once ─────────────────────────────
+        record_data    = await archer_get_record(client, token, req.record_id)
+        field_contents = record_data.get("RequestedObject", {}).get("FieldContents", {})
+
+        # ── 3. Process all 3 QA pairs ────────────────────────────
+        labels = ["Q1", "Q2", "Q3"]
+        answers = []
+
+        for i, pair in enumerate(ARCHER_QA_PAIRS):
+            answer = await process_qa_pair(
+                client         = client,
+                token          = token,
+                field_contents = field_contents,
+                question_field = pair["question_field"],
+                attachment_field = pair["attachment_field"],
+                label          = labels[i],
+            )
+            answers.append(answer)
+
+    print(f"[/analyze] ✅ All 3 questions processed.\n")
+
+    return {
+        "record_id": req.record_id,
+        "answer_q1": answers[0],
+        "answer_q2": answers[1],
+        "answer_q3": answers[2],
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)

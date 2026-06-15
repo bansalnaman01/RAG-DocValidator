@@ -38,7 +38,7 @@ Create a `.env` file in the **root directory** of the project. This file stores 
 ARCHER_INSTANCE=Default
 ARCHER_USERNAME=your_username
 ARCHER_PASSWORD=your_password
-ARCHER_BASE=https://kpmg-test-nfr.archerirm.com.au
+ARCHER_BASE= base_url
 
 # AI Engine Key (Groq)
 GROQ_API_KEY=gsk_your_actual_groq_key_here
